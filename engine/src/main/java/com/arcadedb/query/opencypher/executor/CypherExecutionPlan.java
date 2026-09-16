@@ -53,6 +53,7 @@ import com.arcadedb.query.opencypher.ast.ForeachClause;
 import com.arcadedb.query.opencypher.ast.FunctionCallExpression;
 import com.arcadedb.query.opencypher.ast.InExpression;
 import com.arcadedb.query.opencypher.ast.IsNullExpression;
+import com.arcadedb.query.opencypher.ast.IsTypedExpression;
 import com.arcadedb.query.opencypher.ast.LabelCheckExpression;
 import com.arcadedb.query.opencypher.ast.ListComprehensionExpression;
 import com.arcadedb.query.opencypher.ast.ListExpression;
@@ -1244,6 +1245,51 @@ public class CypherExecutionPlan {
    *
    * @return root execution step
    */
+  /**
+   * Whether the physical plan has already filtered its rows on {@code where}, so the step that would filter them
+   * again can be left out. The step used to be added for every WHERE the optimized path met, on top of the anchor
+   * scan and the filter operator that had evaluated it already, which doubled the cost of every predicate - a
+   * property read and its decoding per row.
+   * <p>
+   * Left out only when dropping it cannot keep a row the step would have dropped:
+   * <ul>
+   * <li>the optimizer recorded this very clause as applied (a clause with no expression never is, and a statement
+   * re-parsed under a cached plan is a different object);</li>
+   * <li>every clause up to the last MATCH is a MATCH, so the plan evaluated the predicate with the same variables
+   * bound as the step would have - an UNWIND between two MATCH clauses binds a variable the plan never sees;</li>
+   * <li>the predicate's own two answers agree. The step keeps a row when {@code evaluate} is true and the filter
+   * operator when {@code evaluateTernary} is TRUE, and {@link BooleanCoercionExpression} - {@code WHERE n.name} -
+   * answers TRUE to the second and false to the first for a non-boolean value. The listed kinds compute
+   * {@code evaluate} as {@code TRUE.equals(evaluateTernary)}, or inherit the ternary from {@code evaluate}; a
+   * conjunction of any predicates is one of them, and a conjunct pushed into the scan is held to {@code evaluate}
+   * there, which is never looser.</li>
+   * </ul>
+   */
+  private boolean filteredByPhysicalPlan(final WhereClause where) {
+    if (physicalPlan == null || where == null || physicalPlan.getLogicalPlan() == null
+        || !physicalPlan.getLogicalPlan().isAppliedByPlan(where))
+      return false;
+
+    final BooleanExpression condition = where.getConditionExpression();
+    if (!(condition instanceof LogicalExpression || condition instanceof ComparisonExpression
+        || condition instanceof InExpression || condition instanceof IsNullExpression
+        || condition instanceof StringMatchExpression || condition instanceof RegexExpression
+        || condition instanceof LabelCheckExpression || condition instanceof IsTypedExpression))
+      return false;
+
+    final List<ClauseEntry> clauses = statement.getClausesInOrder();
+    if (clauses == null)
+      return false;
+    int lastMatch = -1;
+    for (int k = 0; k < clauses.size(); k++)
+      if (clauses.get(k).getType() == ClauseEntry.ClauseType.MATCH)
+        lastMatch = k;
+    for (int k = 0; k < lastMatch; k++)
+      if (clauses.get(k).getType() != ClauseEntry.ClauseType.MATCH)
+        return false;
+    return lastMatch >= 0;
+  }
+
   private AbstractExecutionStep buildExecutionStepsWithOptimizer(final CommandContext context) {
     // Get function factory from evaluator for steps that need it
     final CypherFunctionFactory functionFactory = expressionEvaluator != null ?
@@ -1318,7 +1364,7 @@ public class CypherExecutionPlan {
           currentSegmentMatchClauses.add(matchClause);
           eagerness.observeRead(matchClause);
           collectPatternVariables(matchClause, optimizerBoundVariables);
-          if (matchClause.hasWhereClause()) {
+          if (matchClause.hasWhereClause() && !filteredByPhysicalPlan(matchClause.getWhereClause())) {
             final FilterPropertiesStep filterStep =
                 new FilterPropertiesStep(matchClause.getWhereClause(), context);
             filterStep.setPrevious(currentStep);
@@ -1424,7 +1470,8 @@ public class CypherExecutionPlan {
     }
 
     // Statement-level WHERE clause (not scoped to any MATCH clause)
-    if (statement.getWhereClause() != null && currentStep != null) {
+    if (statement.getWhereClause() != null && currentStep != null
+        && !filteredByPhysicalPlan(statement.getWhereClause())) {
       final FilterPropertiesStep filterStep = new FilterPropertiesStep(statement.getWhereClause(), context);
       filterStep.setPrevious(currentStep);
       currentStep = filterStep;

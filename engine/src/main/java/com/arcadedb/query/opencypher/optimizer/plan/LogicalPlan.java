@@ -34,8 +34,10 @@ import com.arcadedb.query.opencypher.ast.ReturnClause;
 import com.arcadedb.query.opencypher.ast.WhereClause;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import com.arcadedb.query.opencypher.parser.CypherASTBuilder;
 
 import java.util.LinkedHashMap;
@@ -77,6 +79,11 @@ public class LogicalPlan {
   private final Set<String> mixedLabelDisjunctions = new HashSet<>();
   private final ReturnClause returnClause;
   private int anonNodeCounter = 0;
+  /**
+   * The WHERE clauses the physical operators evaluate themselves, by identity - see {@link #markAppliedByPlan}.
+   * Written only while the optimizer builds the plan, before the plan is published to the plan cache.
+   */
+  private final Set<WhereClause> whereFiltersAppliedByPlan = Collections.newSetFromMap(new IdentityHashMap<>());
 
   private LogicalPlan(final CypherStatement statement) {
     this.statement = statement;
@@ -443,6 +450,19 @@ public class LogicalPlan {
    */
   public List<WhereClause> getWhereFilters() {
     return whereFilters;
+  }
+
+  /**
+   * Records that the physical plan filters its rows on {@code whereClause}: every conjunct of it went either into
+   * the anchor scan or into a filter operator above the plan.
+   */
+  public void markAppliedByPlan(final WhereClause whereClause) {
+    whereFiltersAppliedByPlan.add(whereClause);
+  }
+
+  /** Whether {@link #markAppliedByPlan} was called for this very clause object. */
+  public boolean isAppliedByPlan(final WhereClause whereClause) {
+    return whereFiltersAppliedByPlan.contains(whereClause);
   }
 
   /**
