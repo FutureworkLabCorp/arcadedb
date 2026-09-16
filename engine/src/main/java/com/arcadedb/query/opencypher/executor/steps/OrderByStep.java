@@ -43,6 +43,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.PriorityQueue;
+import java.util.Set;
 
 /**
  * Execution step for ORDER BY clause.
@@ -252,16 +253,18 @@ public class OrderByStep extends AbstractExecutionStep {
       private KeyedRow keyed(final Result row) {
         final List<OrderByClause.OrderByItem> items = orderByClause.getItems();
         final Object[] keys = new Object[items.size()];
+        // Asked once per row rather than once per key: a ResultInternal builds a new set of every name on each call.
+        final Set<String> names = row.getPropertyNames();
         for (int i = 0; i < keys.length; i++)
-          keys[i] = extractValue(row, items.get(i));
+          keys[i] = extractValue(row, names, items.get(i));
         return new KeyedRow(row, keys);
       }
 
-      private Object extractValue(final Result result, final OrderByClause.OrderByItem item) {
+      private Object extractValue(final Result result, final Set<String> names, final OrderByClause.OrderByItem item) {
         // First check if the expression text matches a property name in the result
         // This handles ORDER BY on aliased/computed columns (e.g., count(*), n.division)
         final String expression = item.getExpression();
-        if (expression != null && result.getPropertyNames().contains(expression))
+        if (expression != null && names.contains(expression))
           return convertFromStorage(result.getProperty(expression));
 
         // If we have a parsed Expression AST, use ExpressionEvaluator for full expression support

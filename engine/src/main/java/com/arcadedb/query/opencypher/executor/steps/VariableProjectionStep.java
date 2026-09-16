@@ -68,8 +68,10 @@ public class VariableProjectionStep extends AbstractExecutionStep {
           throw new NoSuchElementException();
         final Result input = prevResults.next();
         final ResultInternal projected = new ResultInternal();
+        // Asked once per row: a ResultInternal builds a new set of every name on each call.
+        final Set<String> names = input.getPropertyNames();
         for (final String var : keepVariables) {
-          if (input.getPropertyNames().contains(var))
+          if (names.contains(var))
             projected.setProperty(var, input.getProperty(var));
         }
         LoadCSVRowContext.carryOver(input, projected);
