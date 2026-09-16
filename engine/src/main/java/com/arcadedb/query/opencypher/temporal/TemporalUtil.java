@@ -18,6 +18,8 @@
  */
 package com.arcadedb.query.opencypher.temporal;
 
+import com.arcadedb.GlobalConfiguration;
+
 import java.time.*;
 import java.time.temporal.ChronoUnit;
 import java.time.temporal.IsoFields;
@@ -380,11 +382,11 @@ public final class TemporalUtil {
    * Convert a Cypher temporal value (or a collection/array containing temporal values) to a form
    * that ArcadeDB can serialize.
    *
-   * CypherDateTime is kept as its ISO-8601 string representation (not unwrapped to ZonedDateTime)
-   * so that: (a) untyped properties store it as TYPE_STRING, preserving timezone info for
-   * later component access via {@link #convertFromStorage(Object)}; and (b) for
-   * schema-typed DATETIME properties, Type.convert() parses the string into the target Java type
-   * (timezone is dropped on a LocalDateTime target, matching the SQL sysdate() semantics).
+   * A date and a local datetime become {@code LocalDate} and {@code LocalDateTime}. A zoned datetime, a time, a local
+   * time and a duration have no core Java type that keeps them whole, and are handed to storage as they are: the
+   * serializer writes them as {@code BinaryTypes.TYPE_CYPHER_TEMPORAL}, so they read back as the same temporal and
+   * never as a string. A property the schema declares converts them itself, from
+   * {@link #toLegacyStorageValue(Object)}, exactly as it converted the ISO string it used to receive.
    *
    * Non-temporal scalars and collections of non-temporal scalars are returned unchanged.
    */
@@ -392,18 +394,12 @@ public final class TemporalUtil {
     if (value == null || value instanceof Number || value instanceof String || value instanceof Boolean)
       return value;
 
-    if (value instanceof CypherDateTime dt)
-      return dt.toString();
     if (value instanceof CypherDate d)
       return d.getValue();
     if (value instanceof CypherLocalDateTime ldt)
       return ldt.getValue();
-    if (value instanceof CypherLocalTime lt)
-      return lt.getValue().toString();
-    if (value instanceof CypherTime t)
-      return t.getValue().toString();
-    if (value instanceof CypherDuration dur)
-      return dur.toString();
+    if (value instanceof CypherTemporalValue)
+      return value;
 
     // Recurse into collections - skip when first element is a non-temporal scalar (vector embeddings, etc.)
     if (value instanceof Collection<?> collection) {
@@ -428,6 +424,26 @@ public final class TemporalUtil {
       return converted;
     }
 
+    return value;
+  }
+
+  /**
+   * The value a Cypher temporal was stored as before it had a binary type of its own: the ISO string of a zoned
+   * datetime, a time, a local time or a duration, and the core Java value of a date or a local datetime. It is what a
+   * property the schema declares still converts from, and what a value read from such a property is compared with.
+   * Anything that is not a Cypher temporal is returned unchanged.
+   */
+  public static Object toLegacyStorageValue(final Object value) {
+    if (value instanceof CypherDateTime dt)
+      return dt.toString();
+    if (value instanceof CypherLocalTime lt)
+      return lt.getValue().toString();
+    if (value instanceof CypherTime t)
+      return t.getValue().toString();
+    if (value instanceof CypherDuration dur)
+      return dur.toString();
+    if (value instanceof CypherTemporalValue)
+      return toCoreJavaType(value);
     return value;
   }
 
@@ -467,12 +483,11 @@ public final class TemporalUtil {
 
   /**
    * Convert an ArcadeDB-stored raw property value back to its Cypher temporal type, when
-   * applicable. {@code Duration}, {@code LocalTime}, and {@code Time} are stored as Strings
-   * because ArcadeDB doesn't have native binary types for them; this restores the proper
-   * {@code CypherDuration}/{@code CypherLocalTime}/{@code CypherTime}/etc. wrapper so component
-   * access (e.g. {@code dur.seconds}, {@code t.hour}) keeps working after a property round-trips
-   * through storage. Non-temporal values (including plain, non-temporal-looking Strings) are
-   * returned unchanged.
+   * applicable. A native {@code java.time} / {@code java.util.Date} value is wrapped into its Cypher type, so component
+   * access (e.g. {@code d.year}) keeps working after a property round-trips through storage; a duration, time, local
+   * time or zoned datetime is stored with its own binary type and needs nothing here. A string shaped like one of those
+   * is read as that temporal only while {@code arcadedb.opencypher.readTemporalStrings} is on, for the data older
+   * releases wrote as ISO strings. Every other value is returned unchanged.
    * <p>
    * Shared by every property-read path (variable-bound and chained) so a persisted temporal
    * value dereferences identically regardless of which AST node reads it.
@@ -491,7 +506,9 @@ public final class TemporalUtil {
         return coerced;
     }
 
-    if (value instanceof String str) {
+    // A string is read as a temporal only for the data a release before 26.10.1 wrote, which stored these temporals as
+    // their ISO strings: any string of the same shape is read the same way, so it can be switched off.
+    if (value instanceof String str && GlobalConfiguration.OPENCYPHER_READ_TEMPORAL_STRINGS.getValueAsBoolean()) {
       // Fast path: short strings and common patterns can't be temporal
       if (str.length() < 5 || !Character.isDigit(str.charAt(0)) && str.charAt(0) != 'P')
         return value;

@@ -701,6 +701,16 @@ public enum GlobalConfiguration {
       (see arcadedb.opencypher.planCache).""",
       Boolean.class, true),
 
+  OPENCYPHER_READ_TEMPORAL_STRINGS("arcadedb.opencypher.readTemporalStrings", SCOPE.JVM,
+      """
+      Read a string property shaped like a Cypher duration, time, local time or zoned datetime back as that temporal \
+      value. Releases before 26.10.1 stored those four temporal types as their ISO strings, so this is what brings such \
+      data back as temporals. It also turns a plain string of the same shape - '12:30', '2024-01-01T10:00Z' - into a \
+      temporal, which then compares unequal to the string that was stored. Values written from 26.10.1 on carry their \
+      own binary type and are read correctly either way: set to false once no property holds a temporal written by an \
+      older release.""",
+      Boolean.class, true),
+
   OPENCYPHER_LOAD_CSV_ALLOW_FILE_URLS("arcadedb.opencypher.loadCsv.allowFileUrls", SCOPE.DATABASE,
       """
       Allow LOAD CSV to access local files via file:/// URLs and bare file paths. \

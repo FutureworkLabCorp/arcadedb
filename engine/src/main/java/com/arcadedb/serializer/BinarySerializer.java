@@ -49,6 +49,10 @@ import com.arcadedb.graph.StripeDirectory;
 import com.arcadedb.graph.Vertex;
 import com.arcadedb.graph.VertexInternal;
 import com.arcadedb.log.LogManager;
+import com.arcadedb.query.opencypher.temporal.CypherDateTime;
+import com.arcadedb.query.opencypher.temporal.CypherDuration;
+import com.arcadedb.query.opencypher.temporal.CypherLocalTime;
+import com.arcadedb.query.opencypher.temporal.CypherTime;
 import com.arcadedb.query.sql.executor.Result;
 import com.arcadedb.function.sql.geo.GeoUtils;
 import com.arcadedb.database.BaseDocument;
@@ -70,7 +74,13 @@ import org.locationtech.spatial4j.shape.Shape;
 import java.lang.reflect.Array;
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.time.Instant;
 import java.time.LocalDate;
+import java.time.LocalTime;
+import java.time.OffsetTime;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
@@ -465,6 +475,9 @@ public class BinarySerializer {
     case BinaryTypes.TYPE_COMPRESSED_GEOMETRY:
       serializeGeometryBinary(content, (Shape) value);
       break;
+    case BinaryTypes.TYPE_CYPHER_TEMPORAL:
+      serializeCypherTemporal(content, value);
+      break;
     case BinaryTypes.TYPE_STRING:
       if (value instanceof byte[] bytes)
         content.putBytes(bytes);
@@ -806,6 +819,9 @@ public class BinarySerializer {
       break;
     case BinaryTypes.TYPE_COMPRESSED_GEOMETRY:
       value = deserializeGeometryBinary(content);
+      break;
+    case BinaryTypes.TYPE_CYPHER_TEMPORAL:
+      value = deserializeCypherTemporal(content);
       break;
     case BinaryTypes.TYPE_BYTE:
       value = content.getByte();
@@ -1528,6 +1544,63 @@ public class BinarySerializer {
       LogManager.instance().log(this, Level.WARNING, "Failed to convert shape to WKT, using toString(): %s", e, e.getMessage());
       return shape.toString();
     }
+  }
+
+  /**
+   * Writes a Cypher temporal that has no core Java type as its exact fields rather than as its ISO string: a string
+   * cannot be told apart from a user's string of the same shape when it is read back.
+   */
+  private static void serializeCypherTemporal(final Binary content, final Object value) {
+    switch (value) {
+    case CypherDateTime dateTime -> {
+      final ZonedDateTime zoned = dateTime.getValue();
+      content.putByte(BinaryTypes.TEMPORAL_SUBTYPE_DATETIME);
+      content.putNumber(zoned.toEpochSecond());
+      content.putNumber(zoned.getNano());
+      content.putString(zoned.getZone().getId());
+    }
+    case CypherLocalTime localTime -> {
+      content.putByte(BinaryTypes.TEMPORAL_SUBTYPE_LOCAL_TIME);
+      content.putNumber(localTime.getValue().toNanoOfDay());
+    }
+    case CypherTime time -> {
+      content.putByte(BinaryTypes.TEMPORAL_SUBTYPE_TIME);
+      content.putNumber(time.getValue().toLocalTime().toNanoOfDay());
+      content.putNumber(time.getValue().getOffset().getTotalSeconds());
+    }
+    case CypherDuration duration -> {
+      content.putByte(BinaryTypes.TEMPORAL_SUBTYPE_DURATION);
+      content.putNumber(duration.getMonths());
+      content.putNumber(duration.getDays());
+      content.putNumber(duration.getSeconds());
+      content.putNumber(duration.getNanosAdjustment());
+    }
+    default -> throw new SerializationException("Unsupported Cypher temporal value " + value.getClass().getName());
+    }
+  }
+
+  private static Object deserializeCypherTemporal(final Binary content) {
+    final byte subtype = content.getByte();
+    return switch (subtype) {
+      case BinaryTypes.TEMPORAL_SUBTYPE_DATETIME -> {
+        final long epochSecond = content.getNumber();
+        final int nano = (int) content.getNumber();
+        yield new CypherDateTime(
+            ZonedDateTime.ofInstant(Instant.ofEpochSecond(epochSecond, nano), ZoneId.of(content.getString())));
+      }
+      case BinaryTypes.TEMPORAL_SUBTYPE_LOCAL_TIME -> new CypherLocalTime(LocalTime.ofNanoOfDay(content.getNumber()));
+      case BinaryTypes.TEMPORAL_SUBTYPE_TIME -> {
+        final LocalTime localTime = LocalTime.ofNanoOfDay(content.getNumber());
+        yield new CypherTime(OffsetTime.of(localTime, ZoneOffset.ofTotalSeconds((int) content.getNumber())));
+      }
+      case BinaryTypes.TEMPORAL_SUBTYPE_DURATION -> {
+        final long months = content.getNumber();
+        final long days = content.getNumber();
+        final long seconds = content.getNumber();
+        yield new CypherDuration(months, days, seconds, (int) content.getNumber());
+      }
+      default -> throw new SerializationException("Unknown Cypher temporal subtype " + subtype);
+    };
   }
 
   /**

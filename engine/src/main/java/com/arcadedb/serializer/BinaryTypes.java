@@ -23,6 +23,11 @@ import com.arcadedb.database.Binary;
 import com.arcadedb.database.Document;
 import com.arcadedb.database.RID;
 import com.arcadedb.log.LogManager;
+import com.arcadedb.query.opencypher.temporal.CypherDateTime;
+import com.arcadedb.query.opencypher.temporal.CypherDuration;
+import com.arcadedb.query.opencypher.temporal.CypherLocalTime;
+import com.arcadedb.query.opencypher.temporal.CypherTemporalValue;
+import com.arcadedb.query.opencypher.temporal.CypherTime;
 import com.arcadedb.query.sql.executor.Result;
 import com.arcadedb.schema.Property;
 import com.arcadedb.serializer.json.JSONObject;
@@ -74,6 +79,13 @@ public class BinaryTypes {
   public final static byte TYPE_EXTERNAL                 = 29; // @SINCE 26.5.1 - Property value stored uncompressed in a paired external bucket. Followed by [bucketIdVarint][positionVarint].
   public final static byte TYPE_EXTERNAL_COMPRESSED_FAST = 30; // @SINCE 26.5.1 - Same as TYPE_EXTERNAL but the value bytes in the external blob are LZ4-fast-compressed; the type byte is the dispatcher (no per-blob algo marker needed).
   public final static byte TYPE_EXTERNAL_COMPRESSED_MAX  = 31; // @SINCE 26.5.1 - Same as TYPE_EXTERNAL_COMPRESSED_FAST but compressed with LZ4 HC (high compression, ~10pp smaller output, 8-20x slower compress; decompression is identical to FAST since LZ4 HC uses the same format).
+  public final static byte TYPE_CYPHER_TEMPORAL          = 32; // @SINCE 26.10.1 - A Cypher duration, time, local time or zoned datetime, which have no core Java type here. Followed by the subtype byte and the value's fields.
+
+  // Subtypes for TYPE_CYPHER_TEMPORAL
+  public final static byte TEMPORAL_SUBTYPE_DATETIME   = 1; // zoned datetime: epochSecond(number), nano(number), zoneId(string)
+  public final static byte TEMPORAL_SUBTYPE_LOCAL_TIME = 2; // local time: nanoOfDay(number)
+  public final static byte TEMPORAL_SUBTYPE_TIME       = 3; // time with offset: nanoOfDay(number), offsetSeconds(number)
+  public final static byte TEMPORAL_SUBTYPE_DURATION   = 4; // duration: months, days, seconds, nanos (numbers)
 
   // Geometry subtypes for TYPE_COMPRESSED_GEOMETRY
   public final static byte GEOMETRY_SUBTYPE_POINT     = 1; // Point: x(double), y(double)
@@ -213,6 +225,8 @@ public class BinaryTypes {
       type = TYPE_LIST;
     else if (isGeoSpatialShape(value))
       type = TYPE_COMPRESSED_GEOMETRY; // Shapes are serialized as binary geometry
+    else if (isStoredCypherTemporal(value))
+      type = TYPE_CYPHER_TEMPORAL;
     else if (value instanceof Number) {
       // GENERIC NUMBER IMPLEMENTATION. THIS HAPPENS WITH JSON NUMBERS
       byte t;
@@ -290,10 +304,20 @@ public class BinaryTypes {
       case BinaryTypes.TYPE_ARRAY_OF_FLOATS -> float[].class;
       case BinaryTypes.TYPE_ARRAY_OF_DOUBLES -> double[].class;
       case BinaryTypes.TYPE_COMPRESSED_GEOMETRY -> Shape.class;
+      case BinaryTypes.TYPE_CYPHER_TEMPORAL -> CypherTemporalValue.class;
       case BinaryTypes.TYPE_BINARY -> byte[].class;
       // UNKNOWN
       default -> null;
     };
+  }
+
+  /**
+   * The Cypher temporal values that have no core Java type to be stored as. A date and a local datetime are written as
+   * {@code LocalDate} and {@code LocalDateTime} instead, and never reach this type.
+   */
+  public static boolean isStoredCypherTemporal(final Object value) {
+    return value instanceof CypherDuration || value instanceof CypherTime || value instanceof CypherLocalTime
+        || value instanceof CypherDateTime;
   }
 
   /**
