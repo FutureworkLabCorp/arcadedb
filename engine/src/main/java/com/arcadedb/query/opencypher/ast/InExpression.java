@@ -28,7 +28,10 @@ import com.arcadedb.utility.LongRangeList;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * IN expression for WHERE clauses.
@@ -51,6 +54,37 @@ public class InExpression implements BooleanExpression {
   // comparator (issue #5293) rather than a second, drifting implementation. Held per AST node so no
   // wrapper is allocated per element per row.
   private final ComparisonExpression equalityComparator = ComparisonExpression.valueComparator(ComparisonExpression.Operator.EQUALS);
+
+  /** Below this size a walk is as cheap as hashing the list, so no index is built. */
+  private static final int INDEX_MIN_SIZE = 16;
+
+  /**
+   * Hands every node its own key into {@link CommandContext#getCachedValue(String)}, as the SQL {@code InCondition}
+   * does: that cache is keyed by string, and a sequence cannot collide with another node's key.
+   */
+  private static final AtomicLong INDEX_KEY_SEQUENCE = new AtomicLong();
+
+  /** Lazily assigned on the first row that can use the index. */
+  private volatile String indexKey;
+
+  /**
+   * A list on the right that stays the same object row after row - a query parameter, typically - is walked once per
+   * row, which makes {@code e.x IN $big} O(rows x list). This index answers it in O(1) instead.
+   * <p>
+   * It lives in the command context, not on this node. The node is shared by every execution of a cached statement,
+   * on every thread, so an index held here would be fought over by concurrent executions and could outlive the list
+   * it was built from: a caller that passes the same list object again after changing an element would be answered
+   * from the old contents. The context belongs to one execution.
+   * <p>
+   * It is only built for a list seen on two consecutive rows, so a list rebuilt per row (collect(), a literal of
+   * expressions) never pays for a set it cannot reuse. Within one execution a list is matched by identity and size:
+   * a Cypher list is a value, and nothing changes one in place while a statement runs.
+   */
+  private record MembershipIndex(Collection<?> source, int size, Set<Object> keys, boolean strings) {
+    boolean isFor(final Collection<?> coll) {
+      return source == coll && size == coll.size();
+    }
+  }
 
   public InExpression(final Expression expression, final List<Expression> list) {
     this.expression = expression;
@@ -123,6 +157,12 @@ public class InExpression implements BooleanExpression {
         return found;
     }
 
+    if (list.size() == 1 && valuesToCheck instanceof Collection<?> coll && coll.size() >= INDEX_MIN_SIZE) {
+      final Boolean found = indexedMembership(coll, value, context);
+      if (found != null)
+        return found;
+    }
+
     // 3VL: null IN [1,2,3] -> null, 5 IN [1,null,3] -> null (if not found otherwise)
     boolean foundNull = false;
     for (final Object checkValue : valuesToCheck) {
@@ -190,6 +230,71 @@ public class InExpression implements BooleanExpression {
 
     // Anything else is of a different type than a Long, and for = that is simply not equal.
     return Boolean.FALSE;
+  }
+
+  /**
+   * Membership answered from a hash index, or null when the walk has to answer it.
+   * <p>
+   * The index only exists for a list that is all strings or all Long/Integer, and it only answers a left operand of
+   * the same kind. Those are the pairs for which {@link #valuesCompare} is plain equality: String against String is
+   * {@code compareTo == 0}, and Long/Integer against Long/Integer is a long comparison. Every other pairing can reach
+   * a coercion - a RID-shaped string against a number, a temporal, a double - or a null element's 3VL answer, and is
+   * left to the walk, which is the definition of the answer.
+   */
+  private Boolean indexedMembership(final Collection<?> coll, final Object value, final CommandContext context) {
+    final boolean stringValue = value instanceof String;
+    if (context == null || (!stringValue && !(value instanceof Long || value instanceof Integer)))
+      return null;
+
+    String key = indexKey;
+    if (key == null) {
+      // A benign race: two threads may hand this node two keys, and the loser's index is simply built again.
+      key = "$CYPHER_IN$" + INDEX_KEY_SEQUENCE.incrementAndGet();
+      indexKey = key;
+    }
+
+    MembershipIndex index;
+    // The context's cache is a plain map, and a filter pushed into a parallel operator is evaluated on several
+    // threads against the same context.
+    synchronized (context) {
+      index = context.getCachedValue(key) instanceof MembershipIndex cached && cached.isFor(coll) ? cached : null;
+      if (index == null) {
+        // First sighting of this list: remember it, and walk. Only a second row with the same list builds the set.
+        context.setCachedValue(key, new MembershipIndex(coll, coll.size(), null, false));
+        return null;
+      }
+      if (index.keys() == null) {
+        index = buildIndex(coll);
+        context.setCachedValue(key, index);
+      }
+    }
+    if (index.keys().isEmpty() || index.strings() != stringValue)
+      return null;
+    return index.keys().contains(stringValue ? value : (Object) ((Number) value).longValue());
+  }
+
+  /** An empty key set marks a list the index cannot answer for, so it is not rebuilt on every row. */
+  private static MembershipIndex buildIndex(final Collection<?> coll) {
+    final Set<Object> keys = new HashSet<>(coll.size() * 2);
+    boolean strings = false;
+    boolean integers = false;
+    for (final Object element : coll) {
+      if (element instanceof String) {
+        strings = true;
+        keys.add(element);
+      } else if (element instanceof Long || element instanceof Integer) {
+        integers = true;
+        keys.add(((Number) element).longValue());
+      } else {
+        strings = integers = true; // null, a double, a temporal...: not a list this index can answer for
+        break;
+      }
+      if (strings && integers)
+        break;
+    }
+    if (strings == integers)
+      keys.clear();
+    return new MembershipIndex(coll, coll.size(), keys, strings);
   }
 
   /**
