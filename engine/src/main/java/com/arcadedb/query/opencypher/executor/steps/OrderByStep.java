@@ -66,10 +66,11 @@ public class OrderByStep extends AbstractExecutionStep {
   }
 
   /**
-   * How many rows are asked of the previous step at a time when every row is sorted. All of them are read either
-   * way; the size only decides how many each upstream step buffers before handing them on. Asking for all of them at
-   * once made every step above materialise its whole output before the next one started, which on a 14k-vertex scan
-   * cost more than the sort itself. The pipeline's own batch size lets rows go through the steps together.
+   * How many rows are asked of the previous step at a time, by the full sort and by the top-K heap alike. All of them
+   * are read either way; the size only decides how many each upstream step buffers before handing them on. Asking for
+   * all of them at once made every step above materialise its whole output before the next one started, which on a
+   * 14k-vertex scan cost more than the sort itself. The pipeline's own batch size lets rows go through the steps
+   * together.
    */
   private static final int PULL_BATCH = 100;
 
@@ -195,9 +196,9 @@ public class OrderByStep extends AbstractExecutionStep {
         // Priority queue with reversed comparator: worst elements bubble to top
         final PriorityQueue<KeyedRow> topK = new PriorityQueue<>(Math.min(k + 1, 1000), reversedComparator);
 
-        // Pull all results and maintain a top-K heap
-        final int batchSize = Math.max(1000, k * 10);
-        final ResultSet prevResults = prev.syncPull(context, batchSize);
+        // Pull all results and maintain a top-K heap, at the same granularity as the full sort: a larger batch only
+        // makes every step above buffer more rows before the next one sees them.
+        final ResultSet prevResults = prev.syncPull(context, PULL_BATCH);
 
         while (prevResults.hasNext()) {
           final KeyedRow row = keyed(prevResults.next());
