@@ -28,6 +28,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -132,6 +133,59 @@ class CypherInListMembershipIndexTest {
     assertThat(found(query, params)).containsExactly(true, true, false, false);
     list.set(3, "changed");
     assertThat(found(query, params)).containsExactly(false, false, true, true);
+  }
+
+  @ParameterizedTest(name = "{0}")
+  @ValueSource(strings = {
+      // a list of vertices, collected once and carried to every row
+      "MATCH (k:Item) WHERE k.id % 3 = 0 WITH collect(k) AS kept MATCH (a:Item)",
+      // edges, and a vertex probed against them: a different kind of element, never equal
+      "MATCH ()-[k:L]->() WITH collect(k) AS kept MATCH (a:Item)",
+      "MATCH ()-[k:L]->() WITH collect(k) AS kept MATCH ()-[a:L]->()",
+      // vertices and a string: not one kind, so the walk answers
+      "MATCH (k:Item) WHERE k.id % 3 = 0 WITH collect(k) + ['#1:0'] AS kept MATCH (a:Item)",
+      // vertices and a null: the walk's 3VL answer
+      "MATCH (k:Item) WHERE k.id % 3 = 0 WITH collect(k) + [null] AS kept MATCH (a:Item)" })
+  void graphElementsAgreeWithEquality(final String head) {
+    database.transaction(() -> {
+      database.getSchema().createVertexType("Item");
+      database.getSchema().createEdgeType("L");
+      for (int i = 0; i < 90; i++)
+        database.newVertex("Item").set("id", i).save();
+      database.command("opencypher", "MATCH (a:Item), (b:Item) WHERE b.id = (a.id * 7) % 90 AND a.id % 2 = 0 CREATE (a)-[:L]->(b)");
+    });
+    int seen = 0;
+    try (final ResultSet rs = database.query("opencypher",
+        head + " RETURN a IN kept AS viaIn, any(e IN kept WHERE e = a) AS viaEquality")) {
+      while (rs.hasNext()) {
+        final Result row = rs.next();
+        assertThat((Object) row.getProperty("viaIn")).as("row %d", seen).isEqualTo(row.getProperty("viaEquality"));
+        seen++;
+      }
+    }
+    assertThat(seen).isGreaterThan(40);
+  }
+
+  @Test
+  void lightRagWholeGraphShapeKeepsTheEdgesAmongTheKeptNodes() {
+    // LightRAG's label='*' query: the top nodes by degree, then every relationship with both ends among them.
+    database.transaction(() -> {
+      database.getSchema().createVertexType("Item");
+      database.getSchema().createEdgeType("L");
+      for (int i = 0; i < 90; i++)
+        database.newVertex("Item").set("id", i).save();
+      database.command("opencypher", "MATCH (a:Item), (b:Item) WHERE b.id = (a.id * 7) % 90 AND a.id <> b.id CREATE (a)-[:L]->(b)");
+      database.command("opencypher", "MATCH (a:Item), (b:Item) WHERE b.id = (a.id + 1) % 90 AND a.id % 4 = 0 CREATE (a)-[:L]->(b)");
+    });
+    final String kept = "MATCH (n:Item) OPTIONAL MATCH (n)-[r]-() WITH n, count(r) AS degree "
+        + "ORDER BY degree DESC, n.id ASC LIMIT 30 WITH collect(n) AS kept_nodes ";
+    final long viaIn = database.query("opencypher", kept
+        + "OPTIONAL MATCH (a)-[r]-(b) WHERE a IN kept_nodes AND b IN kept_nodes RETURN count(DISTINCT r) AS c")
+        .next().<Number>getProperty("c").longValue();
+    final long viaEquality = database.query("opencypher", kept
+        + "OPTIONAL MATCH (a)-[r]-(b) WHERE any(x IN kept_nodes WHERE x = a) AND any(y IN kept_nodes WHERE y = b) "
+        + "RETURN count(DISTINCT r) AS c").next().<Number>getProperty("c").longValue();
+    assertThat(viaIn).isPositive().isEqualTo(viaEquality);
   }
 
   private List<Object> found(final String query, final Map<String, Object> params) {

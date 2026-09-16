@@ -18,6 +18,7 @@
  */
 package com.arcadedb.query.opencypher.ast;
 
+import com.arcadedb.database.Identifiable;
 import com.arcadedb.database.RID;
 import com.arcadedb.function.graph.IdFunction;
 import com.arcadedb.query.opencypher.query.OpenCypherQueryEngine;
@@ -68,6 +69,42 @@ public class InExpression implements BooleanExpression {
   private volatile String indexKey;
 
   /**
+   * The operand kinds for which {@link #valuesCompare} is plain equality of a hashable key, so a hash lookup gives the
+   * walk's answer. A list is indexed only when every element is of one kind, and a left operand is looked up only in
+   * a list of its own kind.
+   */
+  private enum KeyKind {
+    /** String against String: {@code compareTo == 0}, which is {@code equals}. */
+    STRING,
+    /** Long/Integer against Long/Integer: a long comparison, so the key is the long value. */
+    INTEGER,
+    /**
+     * A graph element against a graph element: the {@code =} operator compares their RIDs (#6010), whatever
+     * implementation each side is. Neither is a Number or a String, so the RID-string interop above that branch cannot
+     * fire, and {@link RID}'s own equals/hashCode agree, including for the record-less RID of a light edge.
+     */
+    IDENTITY;
+
+    static KeyKind of(final Object value) {
+      if (value instanceof String)
+        return STRING;
+      if (value instanceof Long || value instanceof Integer)
+        return INTEGER;
+      if (value instanceof Identifiable identifiable && identifiable.getIdentity() != null)
+        return IDENTITY;
+      return null;
+    }
+
+    Object key(final Object value) {
+      return switch (this) {
+        case STRING -> value;
+        case INTEGER -> ((Number) value).longValue();
+        case IDENTITY -> ((Identifiable) value).getIdentity();
+      };
+    }
+  }
+
+  /**
    * A list on the right that stays the same object row after row - a query parameter, typically - is walked once per
    * row, which makes {@code e.x IN $big} O(rows x list). This index answers it in O(1) instead.
    * <p>
@@ -80,7 +117,7 @@ public class InExpression implements BooleanExpression {
    * expressions) never pays for a set it cannot reuse. Within one execution a list is matched by identity and size:
    * a Cypher list is a value, and nothing changes one in place while a statement runs.
    */
-  private record MembershipIndex(Collection<?> source, int size, Set<Object> keys, boolean strings) {
+  private record MembershipIndex(Collection<?> source, int size, Set<Object> keys, KeyKind kind) {
     boolean isFor(final Collection<?> coll) {
       return source == coll && size == coll.size();
     }
@@ -235,15 +272,14 @@ public class InExpression implements BooleanExpression {
   /**
    * Membership answered from a hash index, or null when the walk has to answer it.
    * <p>
-   * The index only exists for a list that is all strings or all Long/Integer, and it only answers a left operand of
-   * the same kind. Those are the pairs for which {@link #valuesCompare} is plain equality: String against String is
-   * {@code compareTo == 0}, and Long/Integer against Long/Integer is a long comparison. Every other pairing can reach
-   * a coercion - a RID-shaped string against a number, a temporal, a double - or a null element's 3VL answer, and is
-   * left to the walk, which is the definition of the answer.
+   * The index only exists for a list whose elements are all of one {@link KeyKind}, and it only answers a left
+   * operand of that kind: those are the pairs for which {@link #valuesCompare} is equality of a hashable key. Every
+   * other pairing can reach a coercion - a RID-shaped string against a number, a temporal, a double - or a null
+   * element's 3VL answer, and is left to the walk, which is the definition of the answer.
    */
   private Boolean indexedMembership(final Collection<?> coll, final Object value, final CommandContext context) {
-    final boolean stringValue = value instanceof String;
-    if (context == null || (!stringValue && !(value instanceof Long || value instanceof Integer)))
+    final KeyKind valueKind = KeyKind.of(value);
+    if (context == null || valueKind == null)
       return null;
 
     String key = indexKey;
@@ -260,7 +296,7 @@ public class InExpression implements BooleanExpression {
       index = context.getCachedValue(key) instanceof MembershipIndex cached && cached.isFor(coll) ? cached : null;
       if (index == null) {
         // First sighting of this list: remember it, and walk. Only a second row with the same list builds the set.
-        context.setCachedValue(key, new MembershipIndex(coll, coll.size(), null, false));
+        context.setCachedValue(key, new MembershipIndex(coll, coll.size(), null, null));
         return null;
       }
       if (index.keys() == null) {
@@ -268,33 +304,24 @@ public class InExpression implements BooleanExpression {
         context.setCachedValue(key, index);
       }
     }
-    if (index.keys().isEmpty() || index.strings() != stringValue)
+    if (index.kind() != valueKind)
       return null;
-    return index.keys().contains(stringValue ? value : (Object) ((Number) value).longValue());
+    return index.keys().contains(valueKind.key(value));
   }
 
-  /** An empty key set marks a list the index cannot answer for, so it is not rebuilt on every row. */
+  /** A null kind marks a list the index cannot answer for, so it is not rebuilt on every row. */
   private static MembershipIndex buildIndex(final Collection<?> coll) {
     final Set<Object> keys = new HashSet<>(coll.size() * 2);
-    boolean strings = false;
-    boolean integers = false;
+    KeyKind kind = null;
     for (final Object element : coll) {
-      if (element instanceof String) {
-        strings = true;
-        keys.add(element);
-      } else if (element instanceof Long || element instanceof Integer) {
-        integers = true;
-        keys.add(((Number) element).longValue());
-      } else {
-        strings = integers = true; // null, a double, a temporal...: not a list this index can answer for
-        break;
-      }
-      if (strings && integers)
-        break;
+      // A null element, a double, a temporal, a map, or a second kind: the walk answers.
+      final KeyKind elementKind = KeyKind.of(element);
+      if (elementKind == null || (kind != null && elementKind != kind))
+        return new MembershipIndex(coll, coll.size(), Set.of(), null);
+      kind = elementKind;
+      keys.add(kind.key(element));
     }
-    if (strings == integers)
-      keys.clear();
-    return new MembershipIndex(coll, coll.size(), keys, strings);
+    return new MembershipIndex(coll, coll.size(), keys, kind);
   }
 
   /**
