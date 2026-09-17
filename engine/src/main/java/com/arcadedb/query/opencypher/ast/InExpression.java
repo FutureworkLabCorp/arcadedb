@@ -18,6 +18,7 @@
  */
 package com.arcadedb.query.opencypher.ast;
 
+import com.arcadedb.database.Identifiable;
 import com.arcadedb.database.RID;
 import com.arcadedb.function.graph.IdFunction;
 import com.arcadedb.query.opencypher.query.OpenCypherQueryEngine;
@@ -28,7 +29,10 @@ import com.arcadedb.utility.LongRangeList;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * IN expression for WHERE clauses.
@@ -51,6 +55,73 @@ public class InExpression implements BooleanExpression {
   // comparator (issue #5293) rather than a second, drifting implementation. Held per AST node so no
   // wrapper is allocated per element per row.
   private final ComparisonExpression equalityComparator = ComparisonExpression.valueComparator(ComparisonExpression.Operator.EQUALS);
+
+  /** Below this size a walk is as cheap as hashing the list, so no index is built. */
+  private static final int INDEX_MIN_SIZE = 16;
+
+  /**
+   * Hands every node its own key into {@link CommandContext#getCachedValue(String)}, as the SQL {@code InCondition}
+   * does: that cache is keyed by string, and a sequence cannot collide with another node's key.
+   */
+  private static final AtomicLong INDEX_KEY_SEQUENCE = new AtomicLong();
+
+  /** Lazily assigned on the first row that can use the index. */
+  private volatile String indexKey;
+
+  /**
+   * The operand kinds for which {@link #valuesCompare} is plain equality of a hashable key, so a hash lookup gives the
+   * walk's answer. A list is indexed only when every element is of one kind, and a left operand is looked up only in
+   * a list of its own kind.
+   */
+  private enum KeyKind {
+    /** String against String: {@code compareTo == 0}, which is {@code equals}. */
+    STRING,
+    /** Long/Integer against Long/Integer: a long comparison, so the key is the long value. */
+    INTEGER,
+    /**
+     * A graph element against a graph element: the {@code =} operator compares their RIDs (#6010), whatever
+     * implementation each side is. Neither is a Number or a String, so the RID-string interop above that branch cannot
+     * fire, and {@link RID}'s own equals/hashCode agree, including for the record-less RID of a light edge.
+     */
+    IDENTITY;
+
+    static KeyKind of(final Object value) {
+      if (value instanceof String)
+        return STRING;
+      if (value instanceof Long || value instanceof Integer)
+        return INTEGER;
+      if (value instanceof Identifiable identifiable && identifiable.getIdentity() != null)
+        return IDENTITY;
+      return null;
+    }
+
+    Object key(final Object value) {
+      return switch (this) {
+        case STRING -> value;
+        case INTEGER -> ((Number) value).longValue();
+        case IDENTITY -> ((Identifiable) value).getIdentity();
+      };
+    }
+  }
+
+  /**
+   * A list on the right that stays the same object row after row - a query parameter, typically - is walked once per
+   * row, which makes {@code e.x IN $big} O(rows x list). This index answers it in O(1) instead.
+   * <p>
+   * It lives in the command context, not on this node. The node is shared by every execution of a cached statement,
+   * on every thread, so an index held here would be fought over by concurrent executions and could outlive the list
+   * it was built from: a caller that passes the same list object again after changing an element would be answered
+   * from the old contents. The context belongs to one execution.
+   * <p>
+   * It is only built for a list seen on two consecutive rows, so a list rebuilt per row (collect(), a literal of
+   * expressions) never pays for a set it cannot reuse. Within one execution a list is matched by identity and size:
+   * a Cypher list is a value, and nothing changes one in place while a statement runs.
+   */
+  private record MembershipIndex(Collection<?> source, int size, Set<Object> keys, KeyKind kind) {
+    boolean isFor(final Collection<?> coll) {
+      return source == coll && size == coll.size();
+    }
+  }
 
   public InExpression(final Expression expression, final List<Expression> list) {
     this.expression = expression;
@@ -123,6 +194,12 @@ public class InExpression implements BooleanExpression {
         return found;
     }
 
+    if (list.size() == 1 && valuesToCheck instanceof Collection<?> coll && coll.size() >= INDEX_MIN_SIZE) {
+      final Boolean found = indexedMembership(coll, value, context);
+      if (found != null)
+        return found;
+    }
+
     // 3VL: null IN [1,2,3] -> null, 5 IN [1,null,3] -> null (if not found otherwise)
     boolean foundNull = false;
     for (final Object checkValue : valuesToCheck) {
@@ -190,6 +267,61 @@ public class InExpression implements BooleanExpression {
 
     // Anything else is of a different type than a Long, and for = that is simply not equal.
     return Boolean.FALSE;
+  }
+
+  /**
+   * Membership answered from a hash index, or null when the walk has to answer it.
+   * <p>
+   * The index only exists for a list whose elements are all of one {@link KeyKind}, and it only answers a left
+   * operand of that kind: those are the pairs for which {@link #valuesCompare} is equality of a hashable key. Every
+   * other pairing can reach a coercion - a RID-shaped string against a number, a temporal, a double - or a null
+   * element's 3VL answer, and is left to the walk, which is the definition of the answer.
+   */
+  private Boolean indexedMembership(final Collection<?> coll, final Object value, final CommandContext context) {
+    final KeyKind valueKind = KeyKind.of(value);
+    if (context == null || valueKind == null)
+      return null;
+
+    String key = indexKey;
+    if (key == null) {
+      // A benign race: two threads may hand this node two keys, and the loser's index is simply built again.
+      key = "$CYPHER_IN$" + INDEX_KEY_SEQUENCE.incrementAndGet();
+      indexKey = key;
+    }
+
+    MembershipIndex index;
+    // The context's cache is a plain map, and a filter pushed into a parallel operator is evaluated on several
+    // threads against the same context.
+    synchronized (context) {
+      index = context.getCachedValue(key) instanceof MembershipIndex cached && cached.isFor(coll) ? cached : null;
+      if (index == null) {
+        // First sighting of this list: remember it, and walk. Only a second row with the same list builds the set.
+        context.setCachedValue(key, new MembershipIndex(coll, coll.size(), null, null));
+        return null;
+      }
+      if (index.keys() == null) {
+        index = buildIndex(coll);
+        context.setCachedValue(key, index);
+      }
+    }
+    if (index.kind() != valueKind)
+      return null;
+    return index.keys().contains(valueKind.key(value));
+  }
+
+  /** A null kind marks a list the index cannot answer for, so it is not rebuilt on every row. */
+  private static MembershipIndex buildIndex(final Collection<?> coll) {
+    final Set<Object> keys = new HashSet<>(coll.size() * 2);
+    KeyKind kind = null;
+    for (final Object element : coll) {
+      // A null element, a double, a temporal, a map, or a second kind: the walk answers.
+      final KeyKind elementKind = KeyKind.of(element);
+      if (elementKind == null || (kind != null && elementKind != kind))
+        return new MembershipIndex(coll, coll.size(), Set.of(), null);
+      kind = elementKind;
+      keys.add(kind.key(element));
+    }
+    return new MembershipIndex(coll, coll.size(), keys, kind);
   }
 
   /**
