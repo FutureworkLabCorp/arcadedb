@@ -43,6 +43,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.PriorityQueue;
+import java.util.Set;
 
 /**
  * Execution step for ORDER BY clause.
@@ -57,6 +58,23 @@ import java.util.PriorityQueue;
  * With LIMIT K: Uses priority queue of size K, keeping only top K results.
  */
 public class OrderByStep extends AbstractExecutionStep {
+  /**
+   * A row with its ORDER BY keys, evaluated once. A comparator that evaluates the keys itself pays for them on every
+   * comparison - O(n log n) evaluations of each key for n rows, each a property read or a full expression - where
+   * evaluating them up front pays O(n).
+   */
+  private record KeyedRow(Result row, Object[] keys) {
+  }
+
+  /**
+   * How many rows are asked of the previous step at a time, by the full sort and by the top-K heap alike. All of them
+   * are read either way; the size only decides how many each upstream step buffers before handing them on. Asking for
+   * all of them at once made every step above materialise its whole output before the next one started, which on a
+   * 14k-vertex scan cost more than the sort itself. The pipeline's own batch size lets rows go through the steps
+   * together.
+   */
+  private static final int PULL_BATCH = 100;
+
   private final OrderByClause       orderByClause;
   private final ExpressionEvaluator evaluator;
   private final Integer             limit; // Downstream LIMIT value for Top-K optimization
@@ -125,15 +143,20 @@ public class OrderByStep extends AbstractExecutionStep {
             sortedResults = materializeTopK(limit);
           } else {
             // Standard sorting: materialize all results
-            sortedResults = new ArrayList<>();
-            final ResultSet prevResults = prev.syncPull(context, Integer.MAX_VALUE);
-            while (prevResults.hasNext()) {
-              sortedResults.add(prevResults.next());
-            }
-
-            // Sort results according to ORDER BY clause
-            if (!orderByClause.isEmpty()) {
-              sortedResults.sort(createComparator());
+            final ResultSet prevResults = prev.syncPull(context, PULL_BATCH);
+            if (orderByClause.isEmpty()) {
+              sortedResults = new ArrayList<>();
+              while (prevResults.hasNext())
+                sortedResults.add(prevResults.next());
+            } else {
+              // Sort results according to ORDER BY clause, on keys evaluated once per row
+              final List<KeyedRow> keyedRows = new ArrayList<>();
+              while (prevResults.hasNext())
+                keyedRows.add(keyed(prevResults.next()));
+              keyedRows.sort(createComparator());
+              sortedResults = new ArrayList<>(keyedRows.size());
+              for (final KeyedRow keyedRow : keyedRows)
+                sortedResults.add(keyedRow.row());
             }
           }
         } finally {
@@ -167,26 +190,26 @@ public class OrderByStep extends AbstractExecutionStep {
        * @return list of top K results in correct sort order
        */
       private List<Result> materializeTopK(final int k) {
-        final Comparator<Result> comparator = createComparator();
+        final Comparator<KeyedRow> comparator = createComparator();
         // Reverse comparator for max-heap behavior (worst elements at top)
-        final Comparator<Result> reversedComparator = comparator.reversed();
+        final Comparator<KeyedRow> reversedComparator = comparator.reversed();
 
         // Priority queue with reversed comparator: worst elements bubble to top
-        final PriorityQueue<Result> topK = new PriorityQueue<>(Math.min(k + 1, 1000), reversedComparator);
+        final PriorityQueue<KeyedRow> topK = new PriorityQueue<>(Math.min(k + 1, 1000), reversedComparator);
 
-        // Pull all results and maintain a top-K heap
-        final int batchSize = Math.max(1000, k * 10);
-        final ResultSet prevResults = prev.syncPull(context, batchSize);
+        // Pull all results and maintain a top-K heap, at the same granularity as the full sort: a larger batch only
+        // makes every step above buffer more rows before the next one sees them.
+        final ResultSet prevResults = prev.syncPull(context, PULL_BATCH);
 
         while (prevResults.hasNext()) {
-          final Result row = prevResults.next();
+          final KeyedRow row = keyed(prevResults.next());
 
           if (topK.size() < k) {
             // Haven't reached K elements yet, add unconditionally
             topK.offer(row);
           } else {
             // Heap is full, check if new element is better than worst element
-            final Result worst = topK.peek();
+            final KeyedRow worst = topK.peek();
             if (comparator.compare(row, worst) < 0) {
               // New row is better than worst row, replace it
               topK.poll();  // Remove worst
@@ -199,7 +222,7 @@ public class OrderByStep extends AbstractExecutionStep {
         // Extract results from heap and reverse to get correct sort order
         final List<Result> results = new ArrayList<>(topK.size());
         while (!topK.isEmpty()) {
-          results.add(topK.poll());
+          results.add(topK.poll().row());
         }
 
         // Heap extracts in reverse order, so reverse the list to get correct order
@@ -211,26 +234,37 @@ public class OrderByStep extends AbstractExecutionStep {
       /**
        * Creates a comparator based on ORDER BY items.
        */
-      private Comparator<Result> createComparator() {
+      private Comparator<KeyedRow> createComparator() {
+        final List<OrderByClause.OrderByItem> items = orderByClause.getItems();
         return (r1, r2) -> {
-          for (final OrderByClause.OrderByItem item : orderByClause.getItems()) {
-            final Object v1 = extractValue(r1, item);
-            final Object v2 = extractValue(r2, item);
-
-            final int comparison = compareValues(v1, v2);
+          for (int i = 0; i < items.size(); i++) {
+            final int comparison = compareValues(r1.keys()[i], r2.keys()[i]);
             if (comparison != 0) {
-              return item.isAscending() ? comparison : -comparison;
+              return items.get(i).isAscending() ? comparison : -comparison;
             }
           }
           return 0;
         };
       }
 
-      private Object extractValue(final Result result, final OrderByClause.OrderByItem item) {
+      /**
+       * Evaluates the ORDER BY keys of a row, in item order.
+       */
+      private KeyedRow keyed(final Result row) {
+        final List<OrderByClause.OrderByItem> items = orderByClause.getItems();
+        final Object[] keys = new Object[items.size()];
+        // Asked once per row rather than once per key: a ResultInternal builds a new set of every name on each call.
+        final Set<String> names = row.getPropertyNames();
+        for (int i = 0; i < keys.length; i++)
+          keys[i] = extractValue(row, names, items.get(i));
+        return new KeyedRow(row, keys);
+      }
+
+      private Object extractValue(final Result result, final Set<String> names, final OrderByClause.OrderByItem item) {
         // First check if the expression text matches a property name in the result
         // This handles ORDER BY on aliased/computed columns (e.g., count(*), n.division)
         final String expression = item.getExpression();
-        if (expression != null && result.getPropertyNames().contains(expression))
+        if (expression != null && names.contains(expression))
           return convertFromStorage(result.getProperty(expression));
 
         // If we have a parsed Expression AST, use ExpressionEvaluator for full expression support
