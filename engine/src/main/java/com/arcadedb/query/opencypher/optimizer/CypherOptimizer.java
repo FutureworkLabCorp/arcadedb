@@ -1004,6 +1004,9 @@ public class CypherOptimizer {
 
     for (final WhereClause whereClause : logicalPlan.getWhereFilters()) {
       BooleanExpression filterExpression = whereClause.getConditionExpression();
+      // A clause with no expression is applied by nobody here: the filter step is what evaluates it.
+      if (filterExpression != null)
+        logicalPlan.markAppliedByPlan(whereClause);
 
       if (anchorOperator instanceof NodeByLabelScan scan && anchorVariable != null)
         filterExpression = pushAnchorOnlyConjuncts(filterExpression, anchorVariable, logicalPlan, scan);
