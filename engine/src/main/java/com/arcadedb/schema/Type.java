@@ -28,6 +28,8 @@ import com.arcadedb.database.ImmutableEmbeddedDocument;
 import com.arcadedb.database.MutableEmbeddedDocument;
 import com.arcadedb.database.RID;
 import com.arcadedb.log.LogManager;
+import com.arcadedb.query.opencypher.temporal.CypherTemporalValue;
+import com.arcadedb.query.opencypher.temporal.TemporalUtil;
 import com.arcadedb.query.sql.executor.MultiValue;
 import com.arcadedb.query.sql.executor.Result;
 import com.arcadedb.serializer.BinaryTypes;
@@ -372,12 +374,18 @@ public enum Type {
     return item;
   }
 
-  public static Object convert(final Database database, final Object value, Class<?> targetClass, final Property property) {
+  public static Object convert(final Database database, Object value, Class<?> targetClass, final Property property) {
     if (value == null)
       return null;
 
     if (targetClass == null)
       return value;
+
+    // A Cypher duration, time, local time or zoned datetime reaches a typed property as the value itself (it is stored
+    // with a binary type of its own when the property is not declared). A declared property converts it from the form
+    // it has always received for it: the ISO string, or the core Java value of a date or a local datetime.
+    if (value instanceof CypherTemporalValue)
+      value = TemporalUtil.toLegacyStorageValue(value);
 
     // Coerce the nested scalar values of a collection declared with a scalar "ofType" (e.g. LIST OF LONG, MAP OF LONG) to the
     // declared type. JSON parsing on the write path (e.g. the remote client re-serializing a full record with UPDATE ... CONTENT)

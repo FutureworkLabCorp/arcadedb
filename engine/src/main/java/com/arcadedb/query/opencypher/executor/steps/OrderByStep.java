@@ -18,6 +18,7 @@
  */
 package com.arcadedb.query.opencypher.executor.steps;
 
+import com.arcadedb.GlobalConfiguration;
 import com.arcadedb.schema.Type;
 import com.arcadedb.exception.TimeoutException;
 import com.arcadedb.graph.Edge;
@@ -254,8 +255,7 @@ public class OrderByStep extends AbstractExecutionStep {
 
       /**
        * Convert ArcadeDB-stored values back to Cypher temporal types for proper comparison.
-       * Duration, LocalTime, and Time are stored as Strings because ArcadeDB
-       * doesn't have native binary types for them.
+       * Duration, LocalTime, and Time were stored as Strings before they had a binary type of their own.
        */
       private static Object convertFromStorage(final Object value) {
         // Fast path: common non-temporal types don't need conversion
@@ -284,7 +284,8 @@ public class OrderByStep extends AbstractExecutionStep {
           return converted;
         }
 
-        if (value instanceof String str) {
+        // Only for the ISO strings releases before 26.10.1 stored these temporals as (see TemporalUtil.convertFromStorage).
+        if (value instanceof String str && GlobalConfiguration.OPENCYPHER_READ_TEMPORAL_STRINGS.getValueAsBoolean()) {
           // Fast path: short strings and common patterns can't be temporal
           if (str.length() < 5 || !Character.isDigit(str.charAt(0)) && str.charAt(0) != 'P')
             return value;

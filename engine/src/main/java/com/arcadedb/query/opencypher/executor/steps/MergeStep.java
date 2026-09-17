@@ -1138,8 +1138,9 @@ public class MergeStep extends AbstractExecutionStep {
 
     final String[] propertyNames = bestMatchedProperties.toArray(new String[0]);
     final Object[] propertyValues = new Object[propertyNames.length];
+    // An index is only on declared properties, which hold a temporal in its legacy form (see Type.convert).
     for (int i = 0; i < propertyNames.length; i++)
-      propertyValues[i] = evaluatedProperties.get(propertyNames[i]);
+      propertyValues[i] = TemporalUtil.toLegacyStorageValue(evaluatedProperties.get(propertyNames[i]));
 
     final Iterator<Identifiable> cursor = context.getDatabase().lookupByKey(label, propertyNames, propertyValues);
     return Labels.isInheritedIndex(bestIndex, label) ?

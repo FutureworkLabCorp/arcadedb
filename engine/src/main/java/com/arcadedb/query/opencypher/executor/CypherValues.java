@@ -18,9 +18,11 @@
  */
 package com.arcadedb.query.opencypher.executor;
 
+import com.arcadedb.GlobalConfiguration;
 import com.arcadedb.database.Document;
 import com.arcadedb.exception.InvalidPropertyTypeException;
 import com.arcadedb.query.opencypher.ast.Expression;
+import com.arcadedb.query.opencypher.temporal.CypherTemporalValue;
 import com.arcadedb.query.opencypher.temporal.TemporalUtil;
 
 import java.util.List;
@@ -60,6 +62,14 @@ public final class CypherValues {
     if (a instanceof Number numberA && b instanceof Number numberB)
       return numberA.longValue() == numberB.longValue()
           && Double.compare(numberA.doubleValue(), numberB.doubleValue()) == 0;
+    // A temporal a release before 26.10.1 stored is its ISO string: while that data is read as temporals, it is also
+    // the same value as the temporal it stands for, or a MERGE would create a second node beside it.
+    if (GlobalConfiguration.OPENCYPHER_READ_TEMPORAL_STRINGS.getValueAsBoolean()) {
+      if (a instanceof String && b instanceof CypherTemporalValue)
+        return a.equals(TemporalUtil.toLegacyStorageValue(b));
+      if (b instanceof String && a instanceof CypherTemporalValue)
+        return b.equals(TemporalUtil.toLegacyStorageValue(a));
+    }
     return false;
   }
 
