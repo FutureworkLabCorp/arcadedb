@@ -60,10 +60,20 @@ public class PageId implements Comparable<PageId> {
     return fileId == pageId.fileId && pageNumber == pageId.pageNumber && Objects.equals(database, pageId.database);
   }
 
+  /**
+   * The value {@code Objects.hash(database, fileId, pageNumber)} gives, computed without its varargs array and the two
+   * boxed ints. A page id is created for every page read and looked up in the page cache at once, so the cache kept
+   * here rarely helps: this ran on almost every read, and on a scan of 14k multi-page records it was a quarter of
+   * the samples.
+   */
   @Override
   public int hashCode() {
-    if (cachedHashCode == 0)
-      cachedHashCode = Objects.hash(database, fileId, pageNumber);
+    if (cachedHashCode == 0) {
+      int hash = 31 + Objects.hashCode(database);
+      hash = 31 * hash + fileId;
+      hash = 31 * hash + pageNumber;
+      cachedHashCode = hash;
+    }
     return cachedHashCode;
   }
 
