@@ -181,14 +181,30 @@ public class ServerControlPlane {
    * another group whose log it does not share is the split-brain the leader-side membership change
    * exists to prevent. The Kubernetes auto-join does self-insert, and does it from {@code start()} and
    * only while this node knows no leader of its own - see {@code KubernetesAutoJoin}'s retry
-   * continuation condition. Joining a foreign cluster at runtime is a separate feature, tracked as
-   * issue #7515.
+   * continuation condition.
+   * <p>
+   * Issue #7515 asked whether the other direction should be offered too, as an explicitly destructive "reset
+   * this node and bootstrap it against {@code <address>}". <b>It is not, and the reason is not the local log
+   * but the credentials.</b> A Raft membership change may only be issued by the leader of the cluster being
+   * joined, so a self-join has to authenticate as an administrator of a cluster this node is not a member of
+   * and holds no credentials for. Neither this verb nor the gRPC RPC has a field for them, and giving them one
+   * would put another cluster's root credentials in a server command. The operation the operator wants already
+   * exists and is already authenticated: run this same verb on a server that is ALREADY a member of the target
+   * cluster, naming the node that is joining. {@code RaftHAServer} therefore refuses an add that names its own
+   * node with {@code SelfJoinNotSupportedException}, which says exactly that, instead of accepting it as the
+   * no-op it used to be.
+   * <p>
+   * That also explains the asymmetry with {@code disconnect cluster}, which does act on the local node: leaving
+   * is a statement this node's own cluster already trusts it to make, and joining is not.
    * <p>
    * Every refusal names the address, so an operator with several join attempts in flight can tell
    * which one failed:
    * <ul>
    *   <li>a blank address is an {@link IllegalArgumentException} - HTTP 400, gRPC
    *       {@code INVALID_ARGUMENT} - because the command cannot act without one;</li>
+   *   <li>an address that resolves to this node's own Raft peer id is the same, as
+   *       {@code SelfJoinNotSupportedException} (issue #7515): it is the shape the "make THIS node join"
+   *       mistake takes, and it used to be answered 200 while doing nothing;</li>
    *   <li>HA not enabled at all, and an HA implementation that cannot change membership at runtime,
    *       are both {@link OperationNotAvailableException} - HTTP 500, gRPC
    *       {@code FAILED_PRECONDITION} - a precondition of this server, not a fault of the request.</li>
@@ -287,6 +303,17 @@ public class ServerControlPlane {
     if (server.getStatus() != ArcadeDBServer.STATUS.ONLINE)
       return "Server not started yet";
 
+    // Checked BEFORE - and outside - the readinessRequiresHA gate below, because it answers a different question
+    // (issue #7118). That gate is opt-in and about a node that is BEHIND: still joining, still replaying, which a
+    // deployment can reasonably choose to serve from. A wedged replication-log writer is not that. Ratis rejects
+    // every append after it, so the node cannot catch up and cannot become caught up, and everything it serves is
+    // frozen at the moment the writer failed. Gating this on an opt-in switch would leave the default deployment
+    // - the one the issue describes, a 3-node cluster behind a Service - routing a third of its reads to a
+    // replica that silently stopped moving.
+    final String logFailure = haRaftLogFailure();
+    if (logFailure != null)
+      return "Replication log writer has failed on this node: " + logFailure;
+
     if (server.getConfiguration().getValueAsBoolean(GlobalConfiguration.SERVER_READINESS_REQUIRES_HA)
         && server.getConfiguration().getValueAsBoolean(GlobalConfiguration.HA_ENABLED)) {
       final HAServerPlugin ha = server.getHA();
@@ -299,6 +326,32 @@ public class ServerControlPlane {
     }
 
     return null;
+  }
+
+  /**
+   * The HA layer's persistent log-write failure, or {@code null} when there is none to report - including when
+   * there is no HA layer at all. Reads {@link HAServerPlugin#getRaftLogFailure()}, the signal issue #7037 built
+   * for the {@code HealthMonitor}'s in-place restart and issue #7118 gave its second consumer.
+   * <p>
+   * Defensive against a plugin that throws: readiness is a probe, and a probe that propagates an exception is
+   * answered with a 500 the orchestrator reads as "unknown" rather than as the NOT READY the failing node
+   * deserves. A signal that cannot be read is treated as absent, leaving the gates below to decide.
+   * <p>
+   * Consulted without first testing {@code HA_ENABLED}, and that is what the null check here stands in for: a
+   * server with HA disabled registers no plugin, so {@link ArcadeDBServer#getHA()} is {@code null} and this is
+   * already the whole answer. Reading the setting as well would only add a second way to say the same thing, and
+   * a worse one - the plugin's presence is the fact, the setting is the intent that produced it.
+   */
+  private String haRaftLogFailure() {
+    final HAServerPlugin ha = server.getHA();
+    if (ha == null)
+      return null;
+    try {
+      return ha.getRaftLogFailure();
+    } catch (final Exception e) {
+      LogManager.instance().log(this, Level.WARNING, "Cannot read the HA log-failure signal for the readiness probe", e);
+      return null;
+    }
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -772,10 +825,11 @@ public class ServerControlPlane {
    * <b>This method performs no transport check.</b> It cannot: it does not know how the caller
    * arrived. Deciding whether the answer may be written back is the transport's job. gRPC does it,
    * through {@code GrpcTransportSecurityInterceptor}: the mint is refused unless the call arrived
-   * over TLS or from a loopback peer. <b>HTTP does not</b> - {@code POST /server/api-tokens} mints a
-   * token over a cleartext listener to any host, as it always has - which is filed as issue #7372
-   * rather than changed here, because tightening a route that already behaves this way is a
-   * compatibility decision and not part of adding a second transport.
+   * over TLS or from a loopback peer. HTTP applies the same rule in {@code PostApiTokenHandler}, but
+   * only when {@code arcadedb.server.apiTokenRequireSecureTransport} is on: the route has always
+   * minted over a cleartext listener to any host and Studio's own token UI still does, so refusing by
+   * default is a compatibility decision left to the operator (issue #7372). With the setting off, an
+   * unprotected mint is logged at WARNING.
    *
    * A blank {@code database} means {@code "*"}, every database. That is what an omitted key has always
    * meant over HTTP; it now also covers an explicitly empty one, which previously stored a token scoped
@@ -1056,6 +1110,32 @@ public class ServerControlPlane {
   }
 
   /**
+   * Applies {@code databaseName}'s retention policy to the archives in {@code backupDirectory}, after an on-demand
+   * backup.
+   * <p>
+   * Never fails the backup: the archive is written and the caller is being told so, and a directory that could not
+   * be pruned is an operational problem to log, not a reason to report a successful backup as an error.
+   * <p>
+   * Not a race with the scheduler's own prune, even though both now walk the same directory for the same database:
+   * this runs inside the {@code BackupCoordinator} BACKUP slot {@link #triggerBackup} holds, and {@code BackupTask}
+   * takes the same slot for the scheduled run, so a scheduled backup and an on-demand trigger of one database are
+   * serialised end to end - prune included - rather than overlapping (issue #7472).
+   */
+  private void pruneBackups(final Path backupDirectory, final String databaseName) {
+    final AutoBackupSchedulerPlugin plugin = getBackupPlugin();
+    if (plugin == null)
+      return;
+
+    try {
+      plugin.applyRetention(backupDirectory.toString(), databaseName);
+    } catch (final Exception e) {
+      LogManager.instance().log(this, Level.WARNING,
+          "Cannot apply the backup retention policy for database '%s' after an on-demand backup: %s", databaseName,
+          e.getMessage());
+    }
+  }
+
+  /**
    * Takes the per-database slot for {@code operation}, or refuses naming the operation that already holds it.
    * <p>
    * Every caller must release it with {@link BackupCoordinator#end(String, Operation)} from a {@code finally}: a
@@ -1144,6 +1224,15 @@ public class ServerControlPlane {
 
       final String backupFile = (String) clazz.getMethod("backupDatabase").invoke(backup);
 
+      // PRUNE. THE SCHEDULER PRUNES AFTER EVERY BACKUP IT RUNS; THIS PATH RUNS THE BACKUP INLINE AND PRUNED
+      // NOTHING, SO AN OPERATOR TRIGGERING BACKUPS GREW THE DIRECTORY FOREVER - AND FOR A DATABASE ABSENT FROM THE
+      // AUTO-BACKUP CONFIGURATION THE SCHEDULER COULD NOT HAVE COVERED IT EITHER, BECAUSE RETENTION REGISTRATION
+      // FOLLOWS THE SCHEDULE AND THIS COMMAND CAN NAME ANY DATABASE. PRUNED BY WHAT IS IN THE DIRECTORY, WITH THE
+      // EFFECTIVE POLICY - WHICH FALLS BACK TO THE SERVER-LEVEL DEFAULTS - RATHER THAN BY WHAT IS REGISTERED
+      // (ISSUE #7472). AFTER THE ARCHIVE EXISTS, AND RETENTION ALWAYS KEEPS THE MOST RECENT ONE, SO THE BACKUP
+      // JUST TAKEN IS NEVER THE ONE DELETED
+      pruneBackups(dbBackupPath.getParent(), databaseName);
+
       final JSONObject response = new JSONObject();
       response.put("result", "ok");
       response.put("backupFile", backupFile);
@@ -1180,8 +1269,11 @@ public class ServerControlPlane {
    * the first place, and {@link #getBackupConfig()} reports the same failure as {@code backupDirectoryError} so the
    * operator can see it without triggering anything.
    * <p>
-   * Retention pruning is the scheduler's job and runs only while it is enabled; with the scheduler off an
-   * on-demand archive stays until {@code delete backup} removes it, which is now possible.
+   * Retention pruning runs only while the auto-backup scheduler is ENABLED: with it off, an on-demand archive stays
+   * until {@code delete backup} removes it, which is now possible. While it is on, an on-demand
+   * {@code trigger backup} prunes too, with that database's effective policy - including for a database absent from
+   * the auto-backup configuration, whose archives the scheduler never touches because it does not know about it
+   * (issue #7472).
    */
   public Path resolveBackupDirectory() {
     final Path serverRoot = Paths.get(server.getRootPath()).toAbsolutePath().normalize();
@@ -1742,6 +1834,9 @@ public class ServerControlPlane {
         // FullRestoreFormat must agree with this server's own configuration rather than falling back to the static
         // default, or a per-server override that let the command through would still have the fetch refuse it.
         clazz.getMethod("setAllowLocalUrls", boolean.class).invoke(restorer, isRestoreImportLocalUrlsAllowed());
+        // AND THIS SERVER'S OWN OVERLAY, SO THE FETCH TIMEOUTS ARE THE ONES THE OPERATOR CONFIGURED. THE RESTORER
+        // CANNOT ASK THE TARGET DATABASE FOR THEM - A FRESH RESTORE HAS NOT CREATED IT YET (PR #7755 REVIEW)
+        clazz.getMethod("setConfiguration", ContextConfiguration.class).invoke(restorer, server.getConfiguration());
         clazz.getMethod("setLogger", loggerClass()).invoke(restorer, progressLogger(listener));
         RestoreProgress.installCallback(clazz, restorer, progress, RESTORE_STEPS);
 

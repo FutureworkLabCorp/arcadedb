@@ -19,6 +19,7 @@
 package com.arcadedb.query.sql.antlr;
 
 import com.arcadedb.database.Identifiable;
+import com.arcadedb.engine.timeseries.ColumnDefinition;
 import com.arcadedb.engine.timeseries.DownsamplingTier;
 import com.arcadedb.exception.CommandSQLParsingException;
 import com.arcadedb.index.lsm.LSMTreeIndexAbstract;
@@ -3359,6 +3360,9 @@ public class SQLASTBuilder extends SQLParserBaseVisitor<Object> {
   public BaseExpression visitNullBaseExpr(final SQLParser.NullBaseExprContext ctx) {
     final BaseExpression baseExpr = new BaseExpression();
     baseExpr.isNull = true;
+    // The grammar accepts `NULL modifier*` (`null.ifNull('default')`, `null.asString()`) and this visitor used to
+    // drop the modifiers on the floor, so the whole method/selector chain was silently discarded (issue #7774).
+    baseExpr.modifier = buildModifierChain(ctx.modifier());
     return baseExpr;
   }
 
@@ -6629,6 +6633,8 @@ public class SQLASTBuilder extends SQLParserBaseVisitor<Object> {
     // Extract string literal and remove quotes
     final String rawText = actionCtx.STRING_LITERAL().getText();
     stmt.actionCode = rawText.substring(1, rawText.length() - 1);
+    // KEPT WITH ITS QUOTES SO toString() CAN RE-RENDER THE EXACT ORIGINAL LITERAL (ISSUE #7794)
+    stmt.actionCodeQuoted = rawText;
 
     return stmt;
   }
@@ -6697,38 +6703,52 @@ public class SQLASTBuilder extends SQLParserBaseVisitor<Object> {
     final CreateTimeSeriesTypeStatement stmt = new CreateTimeSeriesTypeStatement();
     final SQLParser.CreateTimeSeriesTypeBodyContext bodyCtx = ctx.createTimeSeriesTypeBody();
 
-    stmt.name = (Identifier) visit(bodyCtx.identifier(0));
+    stmt.name = (Identifier) visit(bodyCtx.identifier());
     stmt.ifNotExists = bodyCtx.IF() != null && bodyCtx.NOT() != null && bodyCtx.EXISTS() != null;
 
-    // TIMESTAMP column and optional PRECISION / CODEC
-    if (bodyCtx.TIMESTAMP() != null && bodyCtx.identifier().size() > 1) {
-      stmt.timestampColumn = (Identifier) visit(bodyCtx.identifier(1));
-      if (bodyCtx.PRECISION() != null && bodyCtx.tsPrecision() != null)
-        // Locale.ENGLISH, not the default locale: the four precision names all contain an 'i', and under a Turkish
-        // default locale the no-arg toUpperCase maps it to a dotted capital that matches none of them (claude
-        // review on PR #7721).
-        stmt.precision = bodyCtx.tsPrecision().getText().toUpperCase(Locale.ENGLISH);
-      // The body-level tsCodecClause is the TIMESTAMP column's: the tag and field ones are nested inside
-      // tsTagColumnDef/tsFieldColumnDef and so are not children of this context.
-      stmt.timestampCodec = codecOf(bodyCtx.tsCodecClause());
-    }
-
-    // TAGS (name type [CODEC name], ...)
-    if (bodyCtx.TAGS() != null) {
-      for (final SQLParser.TsTagColumnDefContext colCtx : bodyCtx.tsTagColumnDef()) {
-        final Identifier colName = (Identifier) visit(colCtx.identifier(0));
-        final Identifier colType = (Identifier) visit(colCtx.identifier(1));
-        stmt.tags.add(new CreateTimeSeriesTypeStatement.ColumnDef(colName, colType, codecOf(colCtx.tsCodecClause())));
+    // The column members - the TIMESTAMP clause and the TAGS/FIELDS groups - in the order they were WRITTEN
+    // (issue #7702). Walked as one list rather than read off bodyCtx.TIMESTAMP()/tsTagColumnDef()/
+    // tsFieldColumnDef(): those accessors answer every timestamp, every tag and every field, each in its own
+    // order, which is precisely the information loss that made a declaration whose roles interleave - or whose
+    // timestamp is not its first column - unspellable. The type stores what it is given, so a statement that
+    // could not say the order created a different type from the builder body that rendered it.
+    stmt.timestampPosition = 0;
+    boolean timestampSeen = false;
+    for (final SQLParser.TsTypeMemberContext memberCtx : bodyCtx.tsTypeMember()) {
+      if (memberCtx.TIMESTAMP() != null) {
+        // Through visit(), not getText(): the raw token text of a back-quoted name carries its quotes and its
+        // escapes, so the message would name a column the user did not write (claude review on PR #7757).
+        final Identifier timestamp = (Identifier) visit(memberCtx.identifier());
+        if (timestampSeen)
+          // The single-TIMESTAMP rule is the TYPE's, and the builder enforces it for every path; saying so here
+          // as well turns a second clause into a parse-time error naming the column, rather than a create that
+          // fails later with the type half-described.
+          throw new CommandSQLParsingException(
+              "A TIMESERIES type has exactly one TIMESTAMP column, and this statement declares a second one: '"
+                  + timestamp.getStringValue() + "'");
+        timestampSeen = true;
+        stmt.timestampPosition = stmt.columns.size();
+        stmt.timestampColumn = timestamp;
+        if (memberCtx.tsPrecision() != null)
+          // Locale.ENGLISH, not the default locale: the four precision names all contain an 'i', and under a
+          // Turkish default locale the no-arg toUpperCase maps it to a dotted capital that matches none of them
+          // (claude review on PR #7721).
+          stmt.precision = memberCtx.tsPrecision().getText().toUpperCase(Locale.ENGLISH);
+        // The member-level tsCodecClause is the TIMESTAMP column's: the tag and field ones are nested inside
+        // tsTagColumnDef/tsFieldColumnDef and so are not children of this context.
+        stmt.timestampCodec = codecOf(memberCtx.tsCodecClause());
+        continue;
       }
-    }
 
-    // FIELDS (name type [CODEC name], ...)
-    if (bodyCtx.FIELDS() != null) {
-      for (final SQLParser.TsFieldColumnDefContext colCtx : bodyCtx.tsFieldColumnDef()) {
-        final Identifier colName = (Identifier) visit(colCtx.identifier(0));
-        final Identifier colType = (Identifier) visit(colCtx.identifier(1));
-        stmt.fields.add(new CreateTimeSeriesTypeStatement.ColumnDef(colName, colType, codecOf(colCtx.tsCodecClause())));
-      }
+      final SQLParser.TsColumnGroupContext groupCtx = memberCtx.tsColumnGroup();
+      if (groupCtx.TAGS() != null)
+        for (final SQLParser.TsTagColumnDefContext colCtx : groupCtx.tsTagColumnDef())
+          stmt.columns.add(columnDef(colCtx.identifier(0), colCtx.identifier(1), ColumnDefinition.ColumnRole.TAG,
+              colCtx.tsCodecClause()));
+      else
+        for (final SQLParser.TsFieldColumnDefContext colCtx : groupCtx.tsFieldColumnDef())
+          stmt.columns.add(columnDef(colCtx.identifier(0), colCtx.identifier(1), ColumnDefinition.ColumnRole.FIELD,
+              colCtx.tsCodecClause()));
     }
 
     // SHARDS count
@@ -6803,6 +6823,17 @@ public class SQLASTBuilder extends SQLParserBaseVisitor<Object> {
       stmt.tiers = parseDownsamplingTiers(bodyCtx.downsamplingTierClause());
 
     return stmt;
+  }
+
+  /**
+   * One {@code name TYPE [CODEC name]} column of a {@code tsColumnGroup}, tagged with the role its group gave it
+   * (issue #7702). The two group branches are identical apart from that role, so they share this.
+   */
+  private CreateTimeSeriesTypeStatement.ColumnDef columnDef(final SQLParser.IdentifierContext nameCtx,
+      final SQLParser.IdentifierContext typeCtx, final ColumnDefinition.ColumnRole role,
+      final SQLParser.TsCodecClauseContext codecCtx) {
+    return new CreateTimeSeriesTypeStatement.ColumnDef((Identifier) visit(nameCtx), (Identifier) visit(typeCtx), role,
+        codecOf(codecCtx));
   }
 
   /**
@@ -7774,10 +7805,18 @@ public class SQLASTBuilder extends SQLParserBaseVisitor<Object> {
     } else if (ctx.CLASSPATH_URL() != null) {
       urlString = ctx.CLASSPATH_URL().getText();
     } else if (ctx.STRING_LITERAL() != null) {
-      urlString = removeQuotes(ctx.STRING_LITERAL().getText());
+      // DECODED (not just unquoted) SO urlString HOLDS THE ACTUAL TARGET - BackupDatabaseStatement.getUrlString()
+      // USES IT AS THE BACKUP FILE PATH, SO AN UN-DECODED \n WOULD TARGET THE WRONG PATH ON RE-PARSE (ISSUE #7800
+      // REVIEW). SAME CONVENTION AS DefineFunctionStatement.code, WHICH ALSO DECODES ALONGSIDE A codeQuoted CACHE.
+      urlString = BaseExpression.decode(removeQuotes(ctx.STRING_LITERAL().getText()));
     }
 
-    return new Url(urlString);
+    final Url url = new Url(urlString);
+    if (ctx.STRING_LITERAL() != null)
+      // KEPT WITH ITS ORIGINAL QUOTES SO toString() CAN RE-RENDER THE EXACT LITERAL WITHOUT RE-ESCAPING
+      // ALREADY-ESCAPED TEXT (ISSUE #7800 REVIEW)
+      url.quotedLiteral = ctx.STRING_LITERAL().getText();
+    return url;
   }
 
   /**
